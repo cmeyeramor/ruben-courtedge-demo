@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Ai Pro Sales - TEC360 Theme */
+body {
+  background: #f5f6f8;
+  min-height: 100vh;
+}
+
+/* Smooth animations */
+* {
+  transition-property: background-color, border-color, box-shadow;
+  transition-duration: 150ms;
+  transition-timing-function: ease-in-out;
+}
+
+/* Scrollbar hidden entirely - scrolling (wheel/trackpad/keyboard) still
+   works via overflow-y-auto on the containers, there's just no visible
+   track/thumb. A solid #ff6b35 thumb read fine in the old narrower chat
+   pane but became a stark vertical bar once the chat area went full-width;
+   even a translucent thumb still read as an unwanted line, so removing it
+   entirely instead of trying to further soften it. */
+* {
+  scrollbar-width: none; /* Firefox */
+}
+
+::-webkit-scrollbar {
+  display: none; /* Chrome, Safari, Edge */
+}

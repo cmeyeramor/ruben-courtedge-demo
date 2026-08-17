@@ -1,0 +1,390 @@
+"""
+Multi-Agent Token Exchange Manager
+
+Handles ID-JAG token exchange for all 4 AI agents with proper access control.
+Each agent gets tokens from its own authorization server.
+
+Key feature: Graceful access denial
+When a user doesn't have access to an agent (based on group membership),
+the exchange returns access_denied instead of failing.
+"""
+
+import logging
+import os
+import json
+from typing import Dict, Any, Optional, List
+from datetime import datetime
+from jose import jwt
+
+from .agent_config import (
+    AgentConfig, get_agent_config, get_all_agent_configs,
+    AGENT_SALES, AGENT_INVENTORY, AGENT_CUSTOMER, AGENT_PRICING,
+    DEMO_AGENTS
+)
+
+logger = logging.getLogger(__name__)
+
+# Try to import the Okta AI SDK
+SDK_AVAILABLE = False
+try:
+    from okta_ai_sdk import OktaAISDK, OktaAIConfig, AuthServerTokenRequest
+    SDK_AVAILABLE = True
+    logger.info("Okta AI SDK loaded successfully")
+except ImportError as e:
+    logger.warning(f"Okta AI SDK not available: {e}. Using demo mode.")
+
+
+class MultiAgentTokenExchange:
+    """
+    Manages token exchange for multiple AI agents.
+
+    Each agent has its own credentials and auth server.
+    Returns access_denied for unauthorized requests instead of errors.
+    """
+
+    def __init__(self):
+        """Initialize token exchange managers for all configured agents."""
+        self.okta_domain = os.getenv("OKTA_DOMAIN", "").strip()
+        if self.okta_domain and not self.okta_domain.startswith("http"):
+            self.okta_domain = f"https://{self.okta_domain}"
+
+        self.main_auth_server_id = os.getenv("OKTA_MAIN_AUTH_SERVER_ID", "default").strip()
+
+        # SDK instances per agent
+        self._sdks: Dict[str, OktaAISDK] = {}
+        self._configs: Dict[str, OktaAIConfig] = {}
+
+        if SDK_AVAILABLE:
+            self._initialize_sdks()
+
+    def _initialize_sdks(self):
+        """Initialize SDK instances for each configured agent."""
+        for agent_type in [AGENT_SALES, AGENT_INVENTORY, AGENT_CUSTOMER, AGENT_PRICING]:
+            config = get_agent_config(agent_type)
+            if not config or not config.agent_id or not config.private_key:
+                logger.info(f"Agent {agent_type} not fully configured, skipping SDK init")
+                continue
+
+            try:
+                okta_config = OktaAIConfig(
+                    oktaDomain=self.okta_domain,
+                    clientId=config.agent_id,
+                    clientSecret="",  # Not used with JWT bearer
+                    authorizationServerId=config.auth_server_id,
+                    principalId=config.agent_id,
+                    privateJWK=config.private_key
+                )
+                self._configs[agent_type] = okta_config
+                self._sdks[agent_type] = OktaAISDK(okta_config)
+                logger.info(f"Initialized SDK for {agent_type} agent")
+            except Exception as e:
+                logger.error(f"Failed to initialize SDK for {agent_type}: {e}")
+
+    def is_agent_available(self, agent_type: str) -> bool:
+        """Check if an agent's SDK is properly initialized."""
+        return agent_type in self._sdks
+
+    async def exchange_token_for_agent(
+        self,
+        agent_type: str,
+        user_id_token: str,
+        requested_scopes: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """
+        Exchange user's ID token for agent-specific access token.
+
+        Args:
+            agent_type: sales, inventory, customer, or pricing
+            user_id_token: User's Okta ID token
+            requested_scopes: Optional specific scopes to request
+
+        Returns:
+            Dict with:
+            - success: bool
+            - access_denied: bool (True if user lacks permission)
+            - access_token: str (if successful)
+            - scopes: List[str]
+            - agent_info: Dict
+            - error: str (if failed)
+        """
+        config = get_agent_config(agent_type)
+        if not config:
+            return self._demo_result(agent_type, user_id_token, requested_scopes)
+
+        scopes = requested_scopes or config.scopes
+
+        # Check if SDK is available for this agent
+        if agent_type not in self._sdks:
+            return self._demo_result(agent_type, user_id_token, scopes)
+
+        sdk = self._sdks[agent_type]
+        okta_config = self._configs[agent_type]
+
+        try:
+            # Step 1: Exchange ID token for ID-JAG token
+            target_audience = f"{self.okta_domain}/oauth2/{config.auth_server_id}"
+            scope_string = " ".join(scopes)
+
+            logger.info(f"[{agent_type}] Step 1: ID token -> ID-JAG, audience={target_audience}")
+
+            # First, we need the main auth server SDK for ID-JAG exchange
+            main_sdk = self._get_main_sdk(config)
+            if not main_sdk:
+                return self._error_result(agent_type, config, "Main SDK not available")
+
+            id_jag_result = main_sdk.cross_app_access.exchange_id_token(
+                id_token=user_id_token,
+                audience=target_audience,
+                scope=scope_string
+            )
+
+            logger.info(f"[{agent_type}] Step 1 SUCCESS: expires_in={id_jag_result.expires_in}s")
+
+            # Decode and log ID-JAG token for debugging and UI display
+            id_jag_claims = {}
+            id_jag_token = id_jag_result.access_token
+            try:
+                id_jag_claims = jwt.get_unverified_claims(id_jag_token)
+                logger.info(f"=== ID-JAG Token [{agent_type.upper()}] ===")
+                logger.info(f"Subject (sub): {id_jag_claims.get('sub')}")
+                logger.info(f"Audience (aud): {id_jag_claims.get('aud')}")
+                logger.info(f"Issuer (iss): {id_jag_claims.get('iss')}")
+                logger.info(f"Scopes: {id_jag_claims.get('scp', id_jag_claims.get('scope', []))}")
+                logger.info(f"Vacation claim: {id_jag_claims.get('Vacation', id_jag_claims.get('is_on_vacation', 'NOT PRESENT'))}")
+                logger.info(f"All claim keys: {list(id_jag_claims.keys())}")
+                # Raw JWT for debugging
+                logger.info(f"=== RAW ID-JAG TOKEN [{agent_type.upper()}] (JWT) ===")
+                logger.info(f"{id_jag_token}")
+                # Full decoded claims for debugging
+                logger.info(f"=== DECODED ID-JAG TOKEN CLAIMS [{agent_type.upper()}] ===")
+                logger.info(json.dumps(id_jag_claims, indent=2, default=str))
+            except Exception as decode_err:
+                logger.warning(f"[{agent_type}] Could not decode ID-JAG token: {decode_err}")
+
+            # Step 2: Exchange ID-JAG for auth server token
+            logger.info(f"[{agent_type}] Step 2: ID-JAG -> Auth Server Token")
+
+            auth_server_request = AuthServerTokenRequest(
+                id_jag_token=id_jag_result.access_token,
+                authorization_server_id=config.auth_server_id,
+                principal_id=okta_config.principal_id,
+                private_jwk=okta_config.private_jwk
+            )
+
+            token_result = sdk.cross_app_access.exchange_id_jag_for_auth_server_token(
+                auth_server_request
+            )
+
+            logger.info(f"[{agent_type}] Step 2 SUCCESS: expires_in={token_result.expires_in}s")
+
+            # Decode Auth Server token claims for debugging and UI display
+            auth_token_claims = {}
+            try:
+                auth_token_claims = jwt.get_unverified_claims(token_result.access_token)
+                logger.info(f"=== Agent Access Token [{agent_type.upper()}] ===")
+                logger.info(f"Subject (sub): {auth_token_claims.get('sub')}")
+                logger.info(f"Audience (aud): {auth_token_claims.get('aud')}")
+                logger.info(f"Scopes: {auth_token_claims.get('scp', auth_token_claims.get('scope', []))}")
+                logger.info(f"Vacation claim: {auth_token_claims.get('Vacation', 'not present')}")
+                logger.info(f"All claim keys: {list(auth_token_claims.keys())}")
+                # Raw JWT for debugging
+                logger.info(f"=== RAW ACCESS TOKEN [{agent_type.upper()}] (JWT) ===")
+                logger.info(f"{token_result.access_token}")
+                # Full decoded claims for debugging
+                logger.info(f"=== DECODED ACCESS TOKEN CLAIMS [{agent_type.upper()}] ===")
+                logger.info(json.dumps(auth_token_claims, indent=2, default=str))
+            except Exception as decode_err:
+                logger.warning(f"[{agent_type}] Could not decode Auth Server token: {decode_err}")
+
+            return {
+                "success": True,
+                "access_denied": False,
+                "access_token": token_result.access_token,
+                "token_type": getattr(token_result, "token_type", "Bearer"),
+                "expires_in": token_result.expires_in,
+                "scopes": scopes,
+                "requested_scopes": scopes,  # Track what was requested
+                "agent_info": {
+                    "name": config.name,  # For Token Exchange card (e.g., "Inventory MCP")
+                    "display_name": config.display_name,  # For Agent Flow card (e.g., "Inventory Agent")
+                    "type": agent_type,
+                    "agent_id": config.agent_id,
+                    "color": config.color,
+                },
+                "auth_server": config.auth_server_id,
+                "audience": config.audience,
+                "demo_mode": False,
+                "exchanged_at": datetime.now().isoformat(),
+                "token_claims": auth_token_claims,  # Decoded access token claims for UI
+                "id_jag_token": id_jag_token,  # Raw ID-JAG token (intermediate)
+                "id_jag_claims": id_jag_claims,  # Decoded ID-JAG claims for UI
+            }
+
+        except Exception as e:
+            error_str = str(e).lower()
+
+            # Check for access denied errors. Okta's real-world error text varies by
+            # failure mode ("no_matching_policy" from the AS, but the SDK also surfaces
+            # a generic "Policy evaluation failed for this request..." 401 for the same
+            # underlying cause) - match on both so real policy denials don't fall through
+            # to the generic error path below and get silently dropped downstream.
+            if (
+                "no_matching_policy" in error_str
+                or "access_denied" in error_str
+                or "policy evaluation failed" in error_str
+            ):
+                logger.info(f"[{agent_type}] ACCESS DENIED for user - policy restriction. Requested scopes: {scopes}")
+                return {
+                    "success": False,
+                    "access_denied": True,
+                    "access_token": None,
+                    "scopes": [],
+                    "requested_scopes": scopes,  # What was requested but denied
+                    "agent_info": {
+                        "name": config.name,
+                        "display_name": config.display_name,
+                        "type": agent_type,
+                        "color": config.color,
+                    },
+                    "error": f"Access denied for scope(s): {', '.join(scopes)}",
+                    "error_code": "access_denied",
+                    "demo_mode": False,
+                }
+
+            # 'subject_token' is invalid at Step 1 (Org AS) almost always means the
+            # user's Okta ID token has expired - NextAuth doesn't refresh it mid-session.
+            if "subject_token" in error_str and "invalid" in error_str:
+                logger.warning(f"[{agent_type}] Subject token invalid (likely expired ID token)")
+                return {
+                    "success": False,
+                    "access_denied": False,
+                    "token_expired": True,
+                    "access_token": None,
+                    "scopes": [],
+                    "requested_scopes": scopes,
+                    "agent_info": {
+                        "name": config.name,
+                        "display_name": config.display_name,
+                        "type": agent_type,
+                        "color": config.color,
+                    },
+                    "error": "Your session has expired. Please sign out and sign back in.",
+                    "error_code": "token_expired",
+                    "demo_mode": False,
+                }
+
+            # Other errors - genuine infrastructure/system failures, distinct from
+            # both of the above so callers never mistake this for "access denied"
+            # or "AI didn't understand the request".
+            logger.error(f"[{agent_type}] Token exchange failed: {e}")
+            return self._error_result(agent_type, config, str(e), scopes)
+
+    def _get_main_sdk(self, agent_config: AgentConfig):
+        """Get or create an SDK for the main auth server (for ID-JAG exchange)."""
+        if not SDK_AVAILABLE or not agent_config.private_key:
+            return None
+
+        try:
+            main_config = OktaAIConfig(
+                oktaDomain=self.okta_domain,
+                clientId=agent_config.agent_id,
+                clientSecret="",
+                authorizationServerId=self.main_auth_server_id,
+                principalId=agent_config.agent_id,
+                privateJWK=agent_config.private_key
+            )
+            return OktaAISDK(main_config)
+        except Exception as e:
+            logger.error(f"Failed to create main SDK: {e}")
+            return None
+
+    def _demo_result(self, agent_type: str, user_id_token: str, requested_scopes: Optional[List[str]] = None) -> Dict[str, Any]:
+        """Return demo mode result when SDK is not configured."""
+        demo_config = DEMO_AGENTS.get(agent_type, {})
+        scopes = requested_scopes or demo_config.get("scopes", [])
+        return {
+            "success": True,
+            "access_denied": False,
+            "access_token": f"demo-{agent_type}-token-{int(datetime.now().timestamp())}",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scopes": scopes,
+            "requested_scopes": scopes,
+            "agent_info": {
+                "name": demo_config.get("name", f"{agent_type.title()} MCP"),
+                "display_name": demo_config.get("display_name", f"{agent_type.title()} Agent"),
+                "type": agent_type,
+                "color": demo_config.get("color", "#888888"),
+            },
+            "demo_mode": True,
+            "exchanged_at": datetime.now().isoformat(),
+            "token_claims": {  # Demo claims for UI display
+                "sub": "demo-user",
+                "aud": demo_config.get("audience", f"api://progear-{agent_type}"),
+                "scope": " ".join(scopes),
+                "demo_mode": True,
+            },
+        }
+
+    def _error_result(
+        self, agent_type: str, config: Optional[AgentConfig], error: str, requested_scopes: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Return error result."""
+        return {
+            "success": False,
+            "access_denied": False,
+            "access_token": None,
+            "scopes": [],
+            "requested_scopes": requested_scopes or [],
+            "agent_info": {
+                "name": config.name if config else f"{agent_type.title()} MCP",
+                "display_name": config.display_name if config else f"{agent_type.title()} Agent",
+                "type": agent_type,
+                "color": config.color if config else "#888888",
+            },
+            "error": error,
+            "error_code": "system_error",
+            "demo_mode": False,
+        }
+
+    async def exchange_for_all_agents(
+        self,
+        user_id_token: str,
+        agent_types: Optional[List[str]] = None,
+        agent_scopes: Optional[Dict[str, List[str]]] = None
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Exchange tokens for multiple agents at once.
+
+        Args:
+            user_id_token: User's ID token
+            agent_types: List of agent types, or None for all
+            agent_scopes: Optional dict mapping agent_type to specific scopes to request
+
+        Returns:
+            Dict mapping agent_type to exchange result
+        """
+        if agent_types is None:
+            agent_types = [AGENT_SALES, AGENT_INVENTORY, AGENT_CUSTOMER, AGENT_PRICING]
+
+        results = {}
+        for agent_type in agent_types:
+            # Get specific scopes for this agent if provided
+            scopes = agent_scopes.get(agent_type) if agent_scopes else None
+            results[agent_type] = await self.exchange_token_for_agent(
+                agent_type, user_id_token, scopes
+            )
+
+        return results
+
+
+# Singleton instance
+_multi_agent_exchange: Optional[MultiAgentTokenExchange] = None
+
+
+def get_multi_agent_exchange() -> MultiAgentTokenExchange:
+    """Get or create the MultiAgentTokenExchange singleton."""
+    global _multi_agent_exchange
+    if _multi_agent_exchange is None:
+        _multi_agent_exchange = MultiAgentTokenExchange()
+    return _multi_agent_exchange

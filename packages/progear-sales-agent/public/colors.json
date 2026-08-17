@@ -1,0 +1,92 @@
+{
+    "brand_identity": {
+        "description": "System prompt instructions for AI to use these specific colors for brand guidelines, UI generation, and design tasks.",
+        "color_palette": {
+            "primary": {
+                "role": "PRIMARIO",
+                "name": "Azul Navy",
+                "hex": "#0E223D",
+                "rgb": {
+                    "r": 14,
+                    "g": 34,
+                    "b": 61
+                },
+                "cmyk": {
+                    "c": 95,
+                    "m": 78,
+                    "y": 43,
+                    "k": 44
+                },
+                "pms": "539 C"
+            },
+            "secondary": {
+                "role": "SECUNDARIO",
+                "name": "Azul",
+                "hex": "#2F5FB4",
+                "rgb": {
+                    "r": 47,
+                    "g": 95,
+                    "b": 180
+                },
+                "cmyk": {
+                    "c": 85,
+                    "m": 63,
+                    "y": 0,
+                    "k": 0
+                },
+                "pms": "2132 C"
+            },
+            "accent": {
+                "role": "ACENTO",
+                "name": "Baby Blue",
+                "hex": "#BED8E5",
+                "rgb": {
+                    "r": 190,
+                    "g": 216,
+                    "b": 229
+                },
+                "cmyk": {
+                    "c": 24,
+                    "m": 6,
+                    "y": 7,
+                    "k": 0
+                },
+                "pms": "545 C"
+            },
+            "neutral": {
+                "role": "NEUTRO",
+                "name": "Gris",
+                "hex": "#D4D4D0",
+                "rgb": {
+                    "r": 212,
+                    "g": 212,
+                    "b": 208
+                },
+                "cmyk": {
+                    "c": 16,
+                    "m": 12,
+                    "y": 17,
+                    "k": 0
+                },
+                "pms": "Cool Gray 2 C"
+            },
+            "base": {
+                "role": "BASE",
+                "name": "Blanco",
+                "hex": "#FFFFFF",
+                "rgb": {
+                    "r": 255,
+                    "g": 255,
+                    "b": 255
+                },
+                "cmyk": {
+                    "c": 0,
+                    "m": 0,
+                    "y": 0,
+                    "k": 0
+                },
+                "pms": null
+            }
+        }
+    }
+}
